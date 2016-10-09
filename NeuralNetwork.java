@@ -1,9 +1,7 @@
 import java.awt.image.*;
 import java.io.*;
 import java.nio.*;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.zip.*;
@@ -12,30 +10,52 @@ class NeuralNetwork {
   private int layers;
   private List<Matrix> bs;
   private List<Matrix> ws;
+  private Cost cost = new CrossEntropyCost();
 
   public NeuralNetwork(int... sizes) {
     this.layers = sizes.length;
     this.bs = new ArrayList<>(sizes.length - 1);
     this.ws = new ArrayList<>(sizes.length - 1);
 
+    Random random = new Random();
+
     for (int i = 1; i < sizes.length; ++i) {
       int neurons = sizes[i];
       int incomingNeurons = sizes[i-1];
 
-      bs.add(new Matrix(neurons, 1).set(Function::random));
-      ws.add(new Matrix(neurons, incomingNeurons).set(Function::random));
+      bs.add(new Matrix(neurons, 1).set((x, y) -> random.nextGaussian()));
+      ws.add(new Matrix(neurons, incomingNeurons).set((x, y) -> random.nextGaussian()));
     }
   }
 
-  public void train(List<Tuple<Matrix>> trainingData,
-                    int minBatchSize,
-                    double learningRate)
+  public NeuralNetwork(File f)
+    throws Exception
   {
-    minBatchSize = Math.min(minBatchSize, trainingData.size());
-    for (int k = 0; k < trainingData.size(); k += minBatchSize) {
+    restore(f);
+  }
 
-      sgd(trainingData.subList(k, Math.min(trainingData.size(), k + minBatchSize)),
-          learningRate);
+  public void train(List<Tuple<Matrix>> training,
+                    int epochs,
+                    int minBatchSize,
+                    double learningRate,
+                    double regularizationParameter,
+                    java.util.function.Consumer<Integer> consumer)
+  {
+    minBatchSize = Math.min(minBatchSize, training.size());
+
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+      Collections.shuffle(training);
+
+      for (int k = 0; k < training.size(); k += minBatchSize) {
+        sgd(training.subList(k, Math.min(training.size(), k + minBatchSize)),
+            learningRate,
+            regularizationParameter,
+            training.size());
+      }
+
+      if (null != consumer) {
+        consumer.accept(epoch);
+      }
     }
   }
 
@@ -43,29 +63,95 @@ class NeuralNetwork {
     return feedforward(x);
   }
 
-  private void sgd(List<Tuple<Matrix>> trainingData, double learningRate) {
+  public void save(File f)
+    throws IOException
+  {
+    try (DataOutputStream out = new DataOutputStream(new FileOutputStream(f))) {
+      out.writeInt(layers);
+      for (Matrix b : bs) {
+        out.writeInt(b.getRow());
+        out.writeInt(b.getColumn());
+        for (int i = 0; i < b.getRow(); ++i) {
+          for (int j = 0; j < b.getColumn(); ++j) {
+            out.writeDouble(b.get(i, j));
+          }
+        }
+      }
+      for (Matrix w : ws) {
+        out.writeInt(w.getRow());
+        out.writeInt(w.getColumn());
+        for (int i = 0; i < w.getRow(); ++i) {
+          for (int j = 0; j < w.getColumn(); ++j) {
+            out.writeDouble(w.get(i, j));
+          }
+        }
+      }
+    }
+  }
+
+  public void restore(File f)
+    throws Exception
+  {
+    try (DataInputStream in = new DataInputStream(new FileInputStream(f))) {
+      this.layers = in.readInt();
+
+      this.bs = new ArrayList<>(this.layers - 1);
+      for (int i = 0; i < (this.layers - 1); ++i) {
+        Matrix b = new Matrix(in.readInt(), in.readInt());
+        for (int j = 0; j < b.getRow(); ++j) {
+          for (int k = 0; k < b.getColumn(); ++k) {
+            b.set(j, k, in.readDouble());
+          }
+        }
+        bs.add(b);
+      }
+
+      this.ws = new ArrayList<>(this.layers - 1);
+      for (int i = 0; i < (this.layers - 1); ++i) {
+        Matrix w = new Matrix(in.readInt(), in.readInt());
+        for (int j = 0; j < w.getRow(); ++j) {
+          for (int k = 0; k < w.getColumn(); ++k) {
+            w.set(j, k, in.readDouble());
+          }
+        }
+
+        ws.add(w);
+      }
+    }
+  }
+
+  private void sgd(List<Tuple<Matrix>> training,
+                   double learningRate,
+                   double regularizationParameter,
+                   int totalTrainingSize) {
     List<Matrix> nablaB = zeros(bs);
     List<Matrix> nablaW = zeros(ws);
 
-    for (Tuple<Matrix> xy : trainingData) {
+    for (Tuple<Matrix> xy : training) {
       Tuple<List<Matrix>> deltaNablaBW = backprop(xy);
 
       zip(nablaB, deltaNablaBW.x, (nb, dnb) -> nb.incrementBy(dnb));
       zip(nablaW, deltaNablaBW.y, (nw, dnw) -> nw.incrementBy(dnw));
     }
 
-    zip(ws, nablaW, (w, nw) -> w.decrementBy(nw.multiplyBy(learningRate / trainingData.size())));
-    zip(bs, nablaB, (b, nb) -> b.decrementBy(nb.multiplyBy(learningRate / trainingData.size())));
+    zip(ws, nablaW, (w, nw) -> w
+        .multiplyBy(1.0 - learningRate * (regularizationParameter/totalTrainingSize))
+        .decrementBy(nw.multiplyBy(learningRate / training.size())));
+
+    zip(bs, nablaB, (b, nb) -> b.decrementBy(nb.multiplyBy(learningRate / training.size())));
   }
 
   private Matrix feedforward(Matrix x) {
-    Matrix[] a = { x };
+    Matrix a = x;
 
-    zip(ws, bs, (w, b) -> {
-        a[0] = w.dot(a[0]).incrementBy(b).set(Function::sigmoid);
-      });
+    for (int i = 0; i < ws.size(); ++i) {
+      Matrix w = ws.get(i);
+      Matrix b = bs.get(i);
 
-    return a[0];
+      a = w.dot(a).incrementBy(b).set(Function::sigmoid);
+    }
+
+    return a;
   }
 
   private Tuple<List<Matrix>> backprop(Tuple<Matrix> xy) {
@@ -82,21 +168,15 @@ class NeuralNetwork {
         as.add(new Matrix(get(zs, -1)).set(Function::sigmoid));
       });
 
-    Matrix delta = new Matrix(xy.y.getRow(), xy.y.getColumn());
-    delta.set((i, j) -> ((get(as, -1).get(i, j)
-                          - xy.y.get(i, j))
-                         * Function.dSigmoid(get(zs, -1).get(i, j))));
+    Matrix delta = cost.delta(get(zs, -1), get(as, -1), xy.y);
     nablaB.add(delta);
     nablaW.add(delta.dot(get(as, -2).transpose()));
 
     for (int l = 2; l < layers; ++l) {
       Matrix z = get(zs, -l);
-      Matrix sp = new Matrix(z).set(Function::dSigmoid);
+      Matrix sp = new Matrix(z).set(Function::dsigmoid);
 
-      delta = sp.multiplyBy(get(ws, -l+1)
-                            .transpose()
-                            .dot(delta)
-                            .get(0, 0));
+      delta = sp.multiplyBy(get(ws, -l+1).transpose().dot(delta));
 
       nablaB.add(delta);
       nablaW.add(delta.dot(get(as, -l-1).transpose()));
@@ -131,6 +211,21 @@ class NeuralNetwork {
 
   }
 
+  private Matrix normalize(List<Tuple<Matrix>> trainingSamples) {
+    Matrix normalizationFactor = new Matrix(trainingSamples.get(0).x.getRow(), 1);
+    for (Tuple<Matrix> m : trainingSamples) {
+      normalizationFactor.set((i, j) -> normalizationFactor.get(i,j) + m.x.get(i, j));
+    }
+
+    normalizationFactor.set((i, j) -> normalizationFactor.get(i, j) / trainingSamples.size());
+
+    for (Tuple<Matrix> m : trainingSamples) {
+      m.x.decrementBy(normalizationFactor);
+    }
+
+    return normalizationFactor;
+  }
+
   // ------------------------------------------------------------
 
   public static class Tuple<T> {
@@ -145,19 +240,82 @@ class NeuralNetwork {
 
   // ------------------------------------------------------------
 
+  public interface Cost {
+    public Matrix delta(Matrix z, Matrix a, Matrix y);
+    public double cost(Matrix a, Matrix y);
+  }
+
+  // ------------------------------------------------------------
+
+  public static class QuadraticCost implements Cost {
+    public double cost(Matrix a, Matrix y) {
+      double total = 0;
+      for (int i = 0; i < a.getRow(); ++i) {
+        for (int j = 0; j < a.getColumn(); ++i) {
+          total += Math.pow(a.get(i, j) - y.get(i, j), 2);
+        }
+      }
+
+      return total / 2;
+    }
+
+    public Matrix delta(Matrix z, Matrix a, Matrix y) {
+      return a.subtract(y).set(Function::dsigmoid);
+    }
+  }
+
+  // ------------------------------------------------------------
+
+  public static class CrossEntropyCost implements Cost {
+    public double cost(Matrix a, Matrix y) {
+      double total = 0;
+      for (int i = 0; i < a.getRow(); ++i) {
+        for (int j = 0; j < a.getColumn(); ++j) {
+          double val = (-y.get(i, j) * Math.log(a.get(i, j))
+                        - (1 - y.get(i, j)) * Math.log(1 - a.get(i, j)));
+          if (!Double.isNaN(val)) {
+            total += val;
+          }
+        }
+      }
+
+      return total;
+    }
+
+    public Matrix delta(Matrix z, Matrix a, Matrix y) {
+      return a.subtract(y);
+    }
+  }
+
+  // ------------------------------------------------------------
+
+  public interface Callback {
+    public void invoke();
+  }
+
   public interface Function {
     public double apply(double v);
 
-    public static double random(double z) {
-      return new java.util.Random().nextGaussian();
+    public static double normal(double z) {
+      return new java.util.Random().nextGaussian() * z;
     }
 
     public static double sigmoid(double z) {
       return 1.0 / (1.0 + Math.exp(-z));
     }
 
-    public static double dSigmoid(double z) {
+    public static double dsigmoid(double z) {
       return sigmoid(z) * (1 - sigmoid(z));
+    }
+
+    public static double tanh(double z) {
+      return Math.tanh(z);
+    }
+
+    public static double dtanh(double z) {
+      double y = Math.tanh(z);
+
+      return (1 - y * y);
     }
   }
 
@@ -198,6 +356,10 @@ class NeuralNetwork {
       return set((i, j) -> get(i, j) - b.get(i, j));
     }
 
+    public Matrix multiplyBy(Matrix b) {
+      return set((i, j) -> get(i, j) * b.get(i, j));
+    }
+
     public Matrix multiplyBy(double v) {
       return set((i, j) -> get(i, j) * v);
     }
@@ -223,7 +385,9 @@ class NeuralNetwork {
 
     public Matrix dot(Matrix b) {
       if (getColumn() != b.getRow()) {
-        throw new RuntimeException("Invalid dimension");
+        throw new RuntimeException(String.format("Cannot dot %sx%s with %sx%s",
+                                                 getRow(), getColumn(),
+                                                 b.getRow(), b.getColumn()));
       }
 
       Matrix a = this;
@@ -237,6 +401,16 @@ class NeuralNetwork {
 
             return result;
         });
+    }
+
+    public double scalar() {
+      if (1 != getRow() || 1 != getColumn()) {
+        throw new IllegalStateException("Not valid for "
+                                        + getRow() + "x" + getColumn()
+                                        + " matrix.");
+      }
+
+      return get(0, 0);
     }
 
     public int getRow() { return val.length; }
@@ -282,7 +456,8 @@ class NeuralNetwork {
         buf.append('[');
         for (int j = 0; j < getColumn(); ++j) {
           if (0 < j) buf.append(", ");
-          buf.append(String.format("%5.3f", val[i][j]));
+          //buf.append(String.format("%5.3f", val[i][j]));
+          buf.append(val[i][j]);
         }
         buf.append("]");
       }
@@ -295,14 +470,42 @@ class NeuralNetwork {
 
   // ------------------------------------------------------------
 
+  public static void test()
+    throws Exception
+  {
+    List<Tuple<Matrix>> training = new ArrayList<>();
+    for (int i = 0; i < 1; ++i) {
+      training.add(new Tuple<>(new Matrix(new double[][] {{ 0 },
+                                                          { 0 }}),
+          new Matrix(new double[][] {{ 0 }})));
+      training.add(new Tuple<>(new Matrix(new double[][] {{ 0 },
+                                                          { 1 }}),
+          new Matrix(new double[][] {{ 1 }})));
+      training.add(new Tuple<>(new Matrix(new double[][] {{ 1 },
+                                                          { 0 }}),
+          new Matrix(new double[][] {{ 1 }})));
+      training.add(new Tuple<>(new Matrix(new double[][] {{ 1 },
+                                                          { 1 }}),
+          new Matrix(new double[][] {{ 0 }})));
+    }
+
+    NeuralNetwork network = new NeuralNetwork(2, 3, 1);
+    network.train(new ArrayList<>(training), 1000, 1, .5, 0, x -> {});
+
+    for (Tuple<Matrix> t : training) {
+      System.out.println(t.y);
+      System.out.println("==>");
+      System.out.println(network.predict(t.x));
+      System.out.println("-----");
+    }
+  }
+
   public static void main(String[] args)
     throws Exception
   {
-    System.out.println(new Matrix(new double[][] { {1, 2, 3},
-                                                   {4, 5, 6}})
-      .incrementBy(new Matrix(new double[][] {{ 1, 1, 1 },
-                                              { 2, 2, 2 }})));
-    String dataDir = "/Users/quangkevin/Programming/Project/test/data";
+    //test();
+    //if (true) return;
+    String dataDir = "data";
 
     List<Tuple<Matrix>> training = neuralTuples(readInput(new File(dataDir + "/train-images-idx3-ubyte.gz")),
                                                 readLabels(new File(dataDir + "/train-labels-idx1-ubyte.gz")));
@@ -311,27 +514,24 @@ class NeuralNetwork {
                                                readLabels(new File(dataDir + "/t10k-labels-idx1-ubyte.gz")));
 
     NeuralNetwork network = new NeuralNetwork(training.get(0).x.getRow(),
-                                              100,
+                                              30,
                                               training.get(0).y.getRow());
 
-    for (int epoch = 0; epoch < 30; ++epoch) {
-      Collections.shuffle(training);
-      network.train(training, 10, .5);
+    network.train(training, 100, 10, .5, 1, epoch -> {
+        int totalGood = 0;
 
-      int totalGood = 0;
-
-      for (Tuple<Matrix> test : testing) {
-        if (fromNeuralOutput(test.y) == fromNeuralOutput(network.predict(test.x))) {
-          ++totalGood;
+        for (Tuple<Matrix> test : testing) {
+          if (fromNeuralOutput(test.y) == fromNeuralOutput(network.predict(test.x))) {
+            ++totalGood;
+          }
         }
-      }
 
-      System.out.printf("%s pred: %s actual: %s percentage: %s\n",
-                        epoch,
-                        totalGood,
-                        testing.size(),
-                        ((double) totalGood/testing.size()) * 100.0);
-    }
+        System.out.printf("%s pred: %s actual: %s percentage: %s\n",
+                          epoch,
+                          totalGood,
+                          testing.size(),
+                          ((double) totalGood/testing.size()) * 100.0);
+      });
   }
 
   private static List<Tuple<Matrix>> neuralTuples(Matrix[] x, int[] y) {
@@ -473,7 +673,7 @@ class NeuralNetwork {
       }
     }
 
-    javax.imageio.ImageIO.write(image, "jpg", new File("/Users/quangkevin/Downloads/test.jpg"));
+    javax.imageio.ImageIO.write(image, "jpg", new File("/tmp/test.jpg"));
 
   }
 }
